@@ -1,239 +1,115 @@
-import os
-import json
-import asyncio
-import aiohttp
+import requests
 from bs4 import BeautifulSoup
-import discord
-from discord.ext import tasks
-from discord import app_commands
-from dotenv import load_dotenv
-import logging
+import time
 
-# --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+# === KONFIGURATION ===
+TELEGRAM_TOKEN = "DEIN_BOT_TOKEN_HIER"
+allowed_users = [123456789]  # <- Deine Telegram-ID hier eintragen
 
-# --- Load environment variables ---
-load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
-GUILD_ID = int(os.getenv('DISCORD_GUILD_ID', 0))
-CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', 0))
+# === GLOBAL STATE ===
+gesehen = set()
+bot_paused = False
+waiting_for_search = {}
+suchbegriffe = ["yamaha aerox", "jetforce", "speedfight", "beta", "roller 50cc", "beta rr50"]
 
-if not TOKEN or not GUILD_ID or not CHANNEL_ID:
-    logging.error("Bitte setze alle Umgebungsvariablen: DISCORD_TOKEN, DISCORD_GUILD_ID, DISCORD_CHANNEL_ID")
-    exit(1)
+def telegram_senden(text, chat_id=None):
+    if chat_id:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": chat_id, "text": text})
+    else:
+        for uid in allowed_users:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": uid, "text": text})
 
-# --- Default Filters ---
-default_filters = {
-    'price_min': 0,
-    'price_max': 600,
-    'km_max': 50
-}
+def befehle_pruefen():
+    global bot_paused, waiting_for_search, suchbegriffe
 
-# --- Seen listings file ---
-SEEN_FILE = 'seen_listings.json'
+    updates = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates").json().get("result", [])
+    for update in updates:
+        if not "message" in update:
+            continue
+        msg = update["message"]
+        chat_id = msg["chat"]["id"]
+        user_id = msg["from"]["id"]
+        text = msg.get("text", "").strip().lower()
 
-# --- Discord Bot Setup ---
-intents = discord.Intents.default()
-bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
-
-# --- Helper Functions ---
-
-def load_seen_ids():
-    if os.path.isfile(SEEN_FILE):
-        try:
-            with open(SEEN_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return set(data)
-        except Exception as e:
-            logging.warning(f"Fehler beim Laden der gespeicherten IDs: {e}")
-            return set()
-    return set()
-
-def save_seen_ids(seen_ids):
-    try:
-        with open(SEEN_FILE, 'w', encoding='utf-8') as f:
-            json.dump(list(seen_ids), f)
-    except Exception as e:
-        logging.error(f"Fehler beim Speichern der gespeicherten IDs: {e}")
-
-def build_search_url():
-    # Aktuelle Kategorie "Scooter" (109) und Suchbegriff "Yamaha Aerox" + Radius 50 km
-    return "https://www.ebay-kleinanzeigen.de/s-scooter/yamaha-aerox/k0c109l3391r0?distance=50"
-
-async def fetch_listings(filters):
-    url = build_search_url()
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
-                      ' Chrome/114.0.0.0 Safari/537.36'
-    }
-    listings = []
-
-    try:
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, timeout=15) as response:
-                if response.status != 200:
-                    logging.warning(f"Unerwarteter HTTP Status: {response.status}")
-                    return []
-                text = await response.text()
-    except Exception as e:
-        logging.error(f"HTTP Fehler beim Abrufen der Seite: {e}")
-        return []
-
-    soup = BeautifulSoup(text, 'html.parser')
-
-    # Artikel finden (Class kann sich ändern, daher fallback-Logik)
-    articles = soup.find_all('article')
-    if not articles:
-        logging.warning("Keine Artikel auf der Seite gefunden - evtl. HTML Struktur geändert?")
-        return []
-
-    for article in articles:
-        try:
-            aid = article.get('data-adid')
-            if not aid:
-                continue
-
-            title_tag = article.find('a', class_='ellipsis')
-            if not title_tag:
-                continue
-            title = title_tag.get_text(strip=True)
-            link = 'https://www.ebay-kleinanzeigen.de' + title_tag.get('href', '')
-
-            price_tag = article.find('p', class_='aditem-main--middle--price')
-            if not price_tag:
-                continue
-            price_str = price_tag.get_text(strip=True).replace('€', '').replace('.', '').replace(',', '').strip()
-            if not price_str.isdigit():
-                continue
-            price = int(price_str)
-
-            desc_tag = article.find('div', class_='aditem-main--bottom')
-            km_val = 0
-            if desc_tag:
-                desc_text = desc_tag.get_text(separator='|')
-                # Suche nach km-Angabe
-                for part in desc_text.split('|'):
-                    part = part.strip().lower()
-                    if 'km' in part:
-                        # Extrahiere Zahlen aus Teilstring
-                        digits = ''.join(c for c in part if c.isdigit())
-                        if digits.isdigit():
-                            km_val = int(digits)
-                            break
-
-            # Thumbnail-Bild finden
-            thumb_tag = article.find('img')
-            thumbnail = None
-            if thumb_tag and thumb_tag.has_attr('src'):
-                thumbnail = thumb_tag['src']
-
-            # Filter anwenden
-            if (filters['price_min'] <= price <= filters['price_max']) and (km_val <= filters['km_max']):
-                listings.append({
-                    'id': aid,
-                    'title': title,
-                    'link': link,
-                    'price': price,
-                    'km': km_val,
-                    'thumbnail': thumbnail
-                })
-
-        except Exception as e:
-            logging.warning(f"Fehler beim Parsen eines Artikels: {e}")
+        if user_id not in allowed_users:
             continue
 
-    logging.info(f"{len(listings)} gefilterte Inserate gefunden.")
-    return listings
+        if user_id in waiting_for_search:
+            begriff = msg["text"].strip()
+            suchbegriffe.clear()
+            suchbegriffe.append(begriff)
+            waiting_for_search.pop(user_id)
+            telegram_senden(f"🔍 Suche gestartet nach: {begriff}", chat_id)
+            continue
 
-# --- Background task ---
+        if text == "/start":
+            telegram_senden("✅ Befehle:\n/search - Neue Suche\n/pause - Bot pausieren\n/resume - Bot starten", chat_id)
+        elif text == "/pause":
+            bot_paused = True
+            telegram_senden("⏸ Bot pausiert.", chat_id)
+        elif text == "/resume":
+            bot_paused = False
+            telegram_senden("▶ Bot läuft wieder.", chat_id)
+        elif text == "/search":
+            waiting_for_search[user_id] = True
+            telegram_senden("Was möchtest du suchen?", chat_id)
 
-@tasks.loop(minutes=5)
-async def check_new_listings():
-    await bot.wait_until_ready()
-    channel = bot.get_channel(CHANNEL_ID)
-    if channel is None:
-        logging.error(f"Channel mit ID {CHANNEL_ID} nicht gefunden!")
-        return
+def suche_starten():
+    global gesehen
+    gefunden = False
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-    seen = load_seen_ids()
-    new_items = []
-    filters = default_filters
+    for begriff in suchbegriffe:
+        url = "https://www.kleinanzeigen.de/s-motorradroller/c305"
+        params = {"keywords": begriff, "maxPrice": 500}
+        response = requests.get(url, params=params, headers=headers)
+        soup = BeautifulSoup(response.text, "html.parser")
+        angebote = soup.select(".aditem")
 
+        for angebot in angebote:
+            a_tag = angebot.select_one("a")
+            titel_tag = angebot.select_one(".ellipsis")
+            preis_tag = angebot.select_one(".aditem-main--middle--price")
+
+            if a_tag and titel_tag and preis_tag:
+                link = "https://www.kleinanzeigen.de" + a_tag["href"]
+                if link in gesehen:
+                    continue
+
+                titel = titel_tag.get_text(strip=True)
+                preis = preis_tag.get_text(strip=True)
+
+                # Detailinfos
+                detail_resp = requests.get(link, headers=headers)
+                detail_soup = BeautifulSoup(detail_resp.text, "html.parser")
+                beschr_tag = detail_soup.select_one(".description-text, .ad-description, #descText")
+                beschreibung = beschr_tag.get_text(strip=True) if beschr_tag else "Keine Beschreibung."
+                bild_tag = detail_soup.select_one(".gallery img, .image-gallery img, img.ad-image")
+                bild_url = bild_tag["src"] if bild_tag and "src" in bild_tag.attrs else None
+
+                nachricht = f"🚨 {begriff.upper()} gefunden!\n\n🛵 {titel}\n💶 {preis}\n📄 {beschreibung[:300]}...\n🔗 {link}"
+                if bild_url:
+                    nachricht += f"\n🖼️ Bild: {bild_url}"
+
+                telegram_senden(nachricht)
+                gesehen.add(link)
+                gefunden = True
+                print(f"✅ {titel} gesendet")
+
+    if not gefunden:
+        print("❌ Nichts Neues gefunden")
+
+# === MAIN LOOP ===
+while True:
     try:
-        listings = await fetch_listings(filters)
-        for item in listings:
-            if item['id'] not in seen:
-                new_items.append(item)
-                seen.add(item['id'])
-        if new_items:
-            save_seen_ids(seen)
-            for item in new_items:
-                embed = discord.Embed(title=item['title'], url=item['link'], color=0x0055ff)
-                embed.add_field(name='Preis', value=f"{item['price']} €", inline=True)
-                embed.add_field(name='Kilometerstand', value=f"{item['km']} km", inline=True)
-                if item['thumbnail']:
-                    embed.set_thumbnail(url=item['thumbnail'])
-                await channel.send(content='@everyone Neue Yamaha Aerox gefunden!', embed=embed)
-            logging.info(f"{len(new_items)} neue Inserate gepostet.")
+        befehle_pruefen()
+        if not bot_paused:
+            suche_starten()
         else:
-            logging.info("Keine neuen Inserate gefunden.")
+            print("⏸ Pausiert...")
+        time.sleep(60)
     except Exception as e:
-        logging.error(f"Fehler beim Background-Task: {e}")
-
-# --- Slash Commands ---
-
-@tree.command(name="search", description="Suche jetzt nach neuen Yamaha Aerox Kleinanzeigen.")
-async def search(interaction: discord.Interaction):
-    await interaction.response.defer()
-    filters = default_filters
-    listings = await fetch_listings(filters)
-    if not listings:
-        await interaction.followup.send("Keine Ergebnisse gefunden.")
-        return
-    # Max 5 Ergebnisse
-    for item in listings[:5]:
-        embed = discord.Embed(title=item['title'], url=item['link'], color=0x0055ff)
-        embed.add_field(name='Preis', value=f"{item['price']} €", inline=True)
-        embed.add_field(name='Kilometerstand', value=f"{item['km']} km", inline=True)
-        if item['thumbnail']:
-            embed.set_thumbnail(url=item['thumbnail'])
-        await interaction.followup.send(embed=embed)
-
-@tree.command(name="setfilters", description="Setze Preis- und Kilometer-Filter.")
-@app_commands.describe(
-    price_min="Minimaler Preis (€, >=0)",
-    price_max="Maximaler Preis (€, >= price_min)",
-    km_max="Maximale Kilometer (>=0)"
-)
-async def setfilters(interaction: discord.Interaction, price_min: int, price_max: int, km_max: int):
-    global default_filters
-    if price_min < 0 or price_max < price_min or km_max < 0:
-        await interaction.response.send_message("Ungültige Filterwerte! Bitte gültige Werte eingeben.", ephemeral=True)
-        return
-    default_filters = {
-        'price_min': price_min,
-        'price_max': price_max,
-        'km_max': km_max
-    }
-    await interaction.response.send_message(
-        f"Filter gesetzt: Preis {price_min}€ - {price_max}€, Kilometer ≤ {km_max} km."
-    )
-    logging.info(f"Filter aktualisiert: {default_filters}")
-
-# --- Bot startup ---
-
-@bot.event
-async def on_ready():
-    if GUILD_ID:
-        guild = discord.Object(id=GUILD_ID)
-        await tree.sync(guild=guild)
-        logging.info(f"Slash Commands zu Guild {GUILD_ID} synchronisiert.")
-    else:
-        await tree.sync()
-        logging.info("Globale Slash Commands synchronisiert.")
-    check_new_listings.start()
-    logging.info(f"Bot ist eingeloggt als {bot.user}")
-
-if __name__ == '__main__':
-    bot.run(TOKEN)
+        print("❌ Fehler:", e)
+        time.sleep(30)
